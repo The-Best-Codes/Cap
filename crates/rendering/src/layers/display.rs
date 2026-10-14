@@ -872,47 +872,68 @@ impl DisplayLayer {
 
                     if let (Some(y_data), Some(u_data), Some(v_data)) = (y_plane, u_plane, v_plane)
                     {
-                        let convert_result = if self.prefer_cpu_conversion {
-                            self.yuv_converter.convert_yuv420p_cpu(
-                                device,
-                                queue,
-                                y_data,
-                                u_data,
-                                v_data,
-                                source_size.x,
-                                source_size.y,
-                                screen_frame.y_stride(),
-                                screen_frame.uv_stride(),
-                            )
+                        let converted_in_place = !self.prefer_cpu_conversion
+                            && self
+                                .yuv_converter
+                                .convert_yuv420p_into(
+                                    device,
+                                    queue,
+                                    encoder,
+                                    y_data,
+                                    u_data,
+                                    v_data,
+                                    source_size.x,
+                                    source_size.y,
+                                    screen_frame.y_stride(),
+                                    screen_frame.uv_stride(),
+                                    &self.frame_texture_views[next_texture],
+                                )
+                                .is_ok();
+                        if converted_in_place {
+                            true
                         } else {
-                            self.yuv_converter.convert_yuv420p_to_encoder(
-                                device,
-                                queue,
-                                encoder,
-                                y_data,
-                                u_data,
-                                v_data,
-                                source_size.x,
-                                source_size.y,
-                                screen_frame.y_stride(),
-                                screen_frame.uv_stride(),
-                            )
-                        };
+                            let convert_result = if self.prefer_cpu_conversion {
+                                self.yuv_converter.convert_yuv420p_cpu(
+                                    device,
+                                    queue,
+                                    y_data,
+                                    u_data,
+                                    v_data,
+                                    source_size.x,
+                                    source_size.y,
+                                    screen_frame.y_stride(),
+                                    screen_frame.uv_stride(),
+                                )
+                            } else {
+                                self.yuv_converter.convert_yuv420p_to_encoder(
+                                    device,
+                                    queue,
+                                    encoder,
+                                    y_data,
+                                    u_data,
+                                    v_data,
+                                    source_size.x,
+                                    source_size.y,
+                                    screen_frame.y_stride(),
+                                    screen_frame.uv_stride(),
+                                )
+                            };
 
-                        match convert_result {
-                            Ok(_) => {
-                                if self.yuv_converter.output_texture().is_some() {
-                                    self.pending_copy = Some(PendingTextureCopy {
-                                        width: source_size.x,
-                                        height: source_size.y,
-                                        dst_texture_index: next_texture,
-                                    });
-                                    true
-                                } else {
-                                    false
+                            match convert_result {
+                                Ok(_) => {
+                                    if self.yuv_converter.output_texture().is_some() {
+                                        self.pending_copy = Some(PendingTextureCopy {
+                                            width: source_size.x,
+                                            height: source_size.y,
+                                            dst_texture_index: next_texture,
+                                        });
+                                        true
+                                    } else {
+                                        false
+                                    }
                                 }
+                                Err(_) => false,
                             }
-                            Err(_) => false,
                         }
                     } else {
                         false

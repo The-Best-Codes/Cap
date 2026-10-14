@@ -1,16 +1,20 @@
 @group(0) @binding(0) var y_plane: texture_2d<f32>;
 @group(0) @binding(1) var u_plane: texture_2d<f32>;
 @group(0) @binding(2) var v_plane: texture_2d<f32>;
-@group(0) @binding(3) var output: texture_storage_2d<rgba8unorm, write>;
 
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let coords = global_id.xy;
-    let dims = textureDimensions(output);
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0)
+    );
+    return vec4<f32>(positions[vertex_index], 0.0, 1.0);
+}
 
-    if (coords.x >= dims.x || coords.y >= dims.y) {
-        return;
-    }
+@fragment
+fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let coords = vec2<u32>(position.xy);
 
     let y_raw = textureLoad(y_plane, coords, 0).r;
 
@@ -30,12 +34,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let g = y - 0.391 * u - 0.813 * v;
     let b = y + 2.018 * u;
 
-    let color = vec4<f32>(
+    return vec4<f32>(
         clamp(r, 0.0, 1.0),
         clamp(g, 0.0, 1.0),
         clamp(b, 0.0, 1.0),
         1.0
     );
-
-    textureStore(output, coords, color);
 }

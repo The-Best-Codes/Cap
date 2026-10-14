@@ -143,7 +143,7 @@ fn validate_dimensions(
 
 struct BindGroupCache {
     nv12_bind_groups: [Option<wgpu::BindGroup>; 2],
-    yuv420p_bind_groups: [Option<wgpu::BindGroup>; 2],
+    yuv420p_bind_group: Option<wgpu::BindGroup>,
     cached_width: u32,
     cached_height: u32,
 }
@@ -152,7 +152,7 @@ impl BindGroupCache {
     fn new() -> Self {
         Self {
             nv12_bind_groups: [None, None],
-            yuv420p_bind_groups: [None, None],
+            yuv420p_bind_group: None,
             cached_width: 0,
             cached_height: 0,
         }
@@ -160,7 +160,7 @@ impl BindGroupCache {
 
     fn invalidate(&mut self) {
         self.nv12_bind_groups = [None, None];
-        self.yuv420p_bind_groups = [None, None];
+        self.yuv420p_bind_group = None;
         self.cached_width = 0;
         self.cached_height = 0;
     }
@@ -216,8 +216,6 @@ impl BindGroupCache {
         y_view: &wgpu::TextureView,
         u_view: &wgpu::TextureView,
         v_view: &wgpu::TextureView,
-        output_view: &wgpu::TextureView,
-        output_index: usize,
         width: u32,
         height: u32,
     ) -> &wgpu::BindGroup {
@@ -227,42 +225,72 @@ impl BindGroupCache {
             self.cached_height = height;
         }
 
-        if self.yuv420p_bind_groups[output_index].is_none() {
-            self.yuv420p_bind_groups[output_index] =
-                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("YUV420P Converter Bind Group (Cached)"),
-                    layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(y_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(u_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(v_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(output_view),
-                        },
-                    ],
-                }));
-        }
-
-        self.yuv420p_bind_groups[output_index].as_ref().unwrap()
+        self.yuv420p_bind_group.get_or_insert_with(|| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("YUV420P Converter Bind Group (Cached)"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(u_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(v_view),
+                    },
+                ],
+            })
+        })
     }
 }
 
 use std::sync::Arc;
 
+#[allow(clippy::too_many_arguments)]
+fn encode_yuv420p_render_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    output_view: &wgpu::TextureView,
+    width: u32,
+    height: u32,
+    allocated_width: u32,
+    allocated_height: u32,
+    label: &str,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: output_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.set_scissor_rect(
+        0,
+        0,
+        (width.div_ceil(8) * 8).min(allocated_width),
+        (height.div_ceil(8) * 8).min(allocated_height),
+    );
+    pass.draw(0..3, 0..1);
+}
+
 pub struct YuvConverterPipelines {
     pub nv12_pipeline: wgpu::ComputePipeline,
-    pub yuv420p_pipeline: wgpu::ComputePipeline,
     pub nv12_bind_group_layout: wgpu::BindGroupLayout,
+    pub yuv420p_pipeline: wgpu::RenderPipeline,
     pub yuv420p_bind_group_layout: wgpu::BindGroupLayout,
 }
 
@@ -274,13 +302,6 @@ impl YuvConverterPipelines {
             label: Some("NV12 to RGBA Converter"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
                 "shaders/nv12_to_rgba.wgsl"
-            ))),
-        });
-
-        let yuv420p_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("YUV420P to RGBA Converter"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "shaders/yuv420p_to_rgba.wgsl"
             ))),
         });
 
@@ -321,65 +342,11 @@ impl YuvConverterPipelines {
                 ],
             });
 
-        let yuv420p_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("YUV420P Converter Bind Group Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
         let nv12_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("NV12 Converter Pipeline Layout"),
             bind_group_layouts: &[&nv12_bind_group_layout],
             push_constant_ranges: &[],
         });
-
-        let yuv420p_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("YUV420P Converter Pipeline Layout"),
-                bind_group_layouts: &[&yuv420p_bind_group_layout],
-                push_constant_ranges: &[],
-            });
 
         let nv12_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("NV12 Converter Pipeline"),
@@ -390,12 +357,56 @@ impl YuvConverterPipelines {
             cache: None,
         });
 
-        let yuv420p_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let yuv420p_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("YUV420P to RGBA Converter"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                "shaders/yuv420p_to_rgba.wgsl"
+            ))),
+        });
+        let plane_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let yuv420p_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("YUV420P Converter Bind Group Layout"),
+                entries: &[plane_entry(0), plane_entry(1), plane_entry(2)],
+            });
+        let yuv420p_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("YUV420P Converter Pipeline Layout"),
+                bind_group_layouts: &[&yuv420p_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let yuv420p_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("YUV420P Converter Pipeline"),
             layout: Some(&yuv420p_pipeline_layout),
-            module: &yuv420p_shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
+            vertex: wgpu::VertexState {
+                module: &yuv420p_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &yuv420p_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
             cache: None,
         });
 
@@ -403,8 +414,8 @@ impl YuvConverterPipelines {
 
         Self {
             nv12_pipeline,
-            yuv420p_pipeline,
             nv12_bind_group_layout,
+            yuv420p_pipeline,
             yuv420p_bind_group_layout,
         }
     }
@@ -750,6 +761,7 @@ impl YuvToRgbaConverter {
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_SRC
                     | wgpu::TextureUsages::COPY_DST,
@@ -1151,8 +1163,6 @@ impl YuvToRgbaConverter {
             &self.y_view,
             &self.u_view,
             &self.v_view,
-            &self.output_views[output_index],
-            output_index,
             self.allocated_width,
             self.allocated_height,
         );
@@ -1161,19 +1171,94 @@ impl YuvToRgbaConverter {
             label: Some("YUV420P Conversion Encoder"),
         });
 
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("YUV420P Conversion Pass"),
-                ..Default::default()
-            });
-            compute_pass.set_pipeline(&self.pipelines.yuv420p_pipeline);
-            compute_pass.set_bind_group(0, bind_group, &[]);
-            compute_pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
-        }
+        encode_yuv420p_render_pass(
+            &mut encoder,
+            &self.pipelines.yuv420p_pipeline,
+            bind_group,
+            &self.output_views[output_index],
+            width,
+            height,
+            self.allocated_width,
+            self.allocated_height,
+            "YUV420P Conversion Pass",
+        );
 
         queue.submit(std::iter::once(encoder.finish()));
 
         Ok(self.current_output_view())
+    }
+
+    /// Converts straight into `target`, a texture the size of the frame,
+    /// instead of this converter's output texture, so the caller does not
+    /// have to copy the result over.
+    #[allow(clippy::too_many_arguments)]
+    pub fn convert_yuv420p_into(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        y_data: &[u8],
+        u_data: &[u8],
+        v_data: &[u8],
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        uv_stride: u32,
+        target: &wgpu::TextureView,
+    ) -> Result<(), YuvConversionError> {
+        let (effective_width, effective_height, downscaled) =
+            validate_dimensions(width, height, self.gpu_max_texture_size)?;
+        if downscaled {
+            return Err(YuvConversionError::DimensionExceedsLimit {
+                dimension: "resolution",
+                value: width.max(height),
+                max: effective_width.max(effective_height),
+            });
+        }
+        self.ensure_texture_size(device, effective_width, effective_height);
+
+        upload_plane_with_stride(queue, &self.y_texture, y_data, width, height, y_stride, "Y")?;
+        upload_plane_with_stride(
+            queue,
+            &self.u_texture,
+            u_data,
+            width / 2,
+            height / 2,
+            uv_stride,
+            "U",
+        )?;
+        upload_plane_with_stride(
+            queue,
+            &self.v_texture,
+            v_data,
+            width / 2,
+            height / 2,
+            uv_stride,
+            "V",
+        )?;
+
+        let bind_group = self.bind_group_cache.get_or_create_yuv420p(
+            device,
+            &self.pipelines.yuv420p_bind_group_layout,
+            &self.y_view,
+            &self.u_view,
+            &self.v_view,
+            self.allocated_width,
+            self.allocated_height,
+        );
+        encode_yuv420p_render_pass(
+            encoder,
+            &self.pipelines.yuv420p_pipeline,
+            bind_group,
+            target,
+            width,
+            height,
+            width,
+            height,
+            "YUV420P Direct Conversion Pass",
+        );
+
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1226,21 +1311,21 @@ impl YuvToRgbaConverter {
             &self.y_view,
             &self.u_view,
             &self.v_view,
-            &self.output_views[output_index],
-            output_index,
             self.allocated_width,
             self.allocated_height,
         );
 
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("YUV420P Conversion Pass (Batched)"),
-                ..Default::default()
-            });
-            compute_pass.set_pipeline(&self.pipelines.yuv420p_pipeline);
-            compute_pass.set_bind_group(0, bind_group, &[]);
-            compute_pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
-        }
+        encode_yuv420p_render_pass(
+            encoder,
+            &self.pipelines.yuv420p_pipeline,
+            bind_group,
+            &self.output_views[output_index],
+            width,
+            height,
+            self.allocated_width,
+            self.allocated_height,
+            "YUV420P Conversion Pass (Batched)",
+        );
 
         Ok(self.current_output_view())
     }

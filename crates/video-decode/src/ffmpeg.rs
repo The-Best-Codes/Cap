@@ -148,7 +148,9 @@ pub fn get_hw_decoder_capabilities() -> &'static HwDecoderCapabilities {
     HW_CAPABILITIES.get_or_init(query_d3d11_video_decoder_capabilities)
 }
 
-fn configure_software_threading(decoder: &mut avcodec::decoder::Video, width: u32, height: u32) {
+/// Must run before the codec is opened: FFmpeg reads `thread_count` and
+/// `thread_type` in `avcodec_open2`, and ignores them afterwards.
+fn configure_software_threading(context: &mut avcodec::Context, width: u32, height: u32) {
     let pixel_count = (width as u64) * (height as u64);
     let cpu_count = num_cpus::get();
 
@@ -163,7 +165,7 @@ fn configure_software_threading(decoder: &mut avcodec::decoder::Video, width: u3
     let thread_type = ffmpeg::sys::FF_THREAD_FRAME | ffmpeg::sys::FF_THREAD_SLICE;
 
     unsafe {
-        let codec_ctx = decoder.as_mut_ptr();
+        let codec_ctx = context.as_mut_ptr();
         if !codec_ctx.is_null() {
             (*codec_ctx).thread_count = thread_count;
             (*codec_ctx).thread_type = thread_type;
@@ -326,50 +328,71 @@ impl FFmpegDecoder {
 
         let stream_index = input_stream.index();
 
-        let mut decoder = avcodec::Context::from_parameters(input_stream.parameters())
-            .map_err(|e| format!("decoder context / {e}"))?
-            .decoder()
-            .video()
-            .map_err(|e| format!("video decoder / {e}"))?;
-
-        decoder.set_time_base(input_stream.time_base());
-
-        let width = decoder.width();
-        let height = decoder.height();
+        let parameters = input_stream.parameters();
+        let time_base = input_stream.time_base();
+        let (width, height) = unsafe {
+            let parameters = parameters.as_ptr();
+            ((*parameters).width as u32, (*parameters).height as u32)
+        };
+        // Only a complete file is drained at its end (see `FramesIter`), so
+        // only it may hold frames back in a threaded decoder.
+        let threaded = matches!(input, DecoderInput::File(_));
+        let open_software = |parameters: avcodec::Parameters| {
+            let mut context = avcodec::Context::from_parameters(parameters)
+                .map_err(|e| format!("decoder context / {e}"))?;
+            if threaded {
+                configure_software_threading(&mut context, width, height);
+            }
+            let mut decoder = context
+                .decoder()
+                .video()
+                .map_err(|e| format!("video decoder / {e}"))?;
+            decoder.set_time_base(time_base);
+            Ok::<_, String>(decoder)
+        };
 
         let hw_caps = get_hw_decoder_capabilities();
         let exceeds_hw_limits =
             width > hw_caps.max_width || height > hw_caps.max_height || !hw_caps.supports_hw_decode;
 
-        let hw_device = hw_device_type.and_then(|hw_device_type| {
-            if exceeds_hw_limits {
+        let hardware = match hw_device_type {
+            Some(_) if exceeds_hw_limits => {
                 warn!(
                     "Video dimensions {width}x{height} exceed hardware decoder limits ({}x{}), using software decode",
                     hw_caps.max_width, hw_caps.max_height
                 );
-                configure_software_threading(&mut decoder, width, height);
                 None
-            } else {
+            }
+            Some(hw_device_type) => {
+                let mut decoder = avcodec::Context::from_parameters(parameters.clone())
+                    .map_err(|e| format!("decoder context / {e}"))?
+                    .decoder()
+                    .video()
+                    .map_err(|e| format!("video decoder / {e}"))?;
+                decoder.set_time_base(time_base);
                 match decoder.try_use_hw_device(hw_device_type) {
                     Ok(device) => {
                         info!(
                             "Using hardware acceleration for {width}x{height} video (device: {:?})",
                             hw_device_type
                         );
-                        Some(device)
+                        Some((decoder, device))
                     }
                     Err(error) => {
-                        warn!("Failed to enable hardware decoder: {error:?}, falling back to optimized software decode");
-                        configure_software_threading(&mut decoder, width, height);
+                        warn!(
+                            "Failed to enable hardware decoder: {error:?}, falling back to optimized software decode"
+                        );
                         None
                     }
                 }
             }
-        });
+            None => None,
+        };
 
-        if hw_device.is_none() && hw_device_type.is_none() {
-            configure_software_threading(&mut decoder, width, height);
-        }
+        let (decoder, hw_device) = match hardware {
+            Some((decoder, device)) => (decoder, Some(device)),
+            None => (open_software(parameters)?, None),
+        };
 
         Ok(FFmpegDecoder {
             input,
@@ -395,6 +418,7 @@ impl FFmpegDecoder {
             decoder: &mut self.decoder,
             stream_index: self.stream_index,
             hw_device: self.hw_device.as_mut(),
+            draining: false,
         }
     }
 
@@ -418,6 +442,7 @@ pub struct FramesIter<'a> {
     packets: DecoderPackets<'a>,
     stream_index: usize,
     hw_device: Option<&'a mut HwDevice>,
+    draining: bool,
 }
 
 impl FramesIter<'_> {
@@ -450,9 +475,23 @@ impl<'a> Iterator for FramesIter<'a> {
                 Err(e) => return Some(Err(e)),
             }
 
-            let (stream_index, packet) = match self.packets.next()? {
-                Ok(packet) => packet,
-                Err(error) => return Some(Err(error)),
+            if self.draining {
+                return None;
+            }
+
+            let (stream_index, packet) = match self.packets.next() {
+                Some(Ok(packet)) => packet,
+                Some(Err(error)) => return Some(Err(error)),
+                // A threaded decoder still holds the file's last frames. A
+                // segmented input may grow, so it stays open for more packets.
+                None if matches!(self.packets, DecoderPackets::File(_)) => {
+                    self.draining = true;
+                    match self.decoder.send_eof() {
+                        Ok(()) | Err(ffmpeg::Error::Eof) => continue,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                None => return None,
             };
 
             if stream_index != self.stream_index {
